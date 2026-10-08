@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Prüfstellen-Finder</title>
+<meta name="theme-color" content="#1f4f8a">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  :root{--bg:#fff;--fg:#1b1b1b;--muted:#6a6a6a;--line:#d9dde3;--soft:#eef2f7;--accent:#1f4f8a;--go:#1a7f37}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:15px/1.35 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  body{display:flex;flex-direction:column;height:100vh;height:100dvh}
+  header{padding:8px 10px 4px;border-bottom:1px solid var(--line);background:var(--bg)}
+  form{display:flex;gap:6px}
+  input{flex:1;min-width:0;padding:9px 10px;border:1px solid var(--line);border-radius:8px;font-size:16px;background:var(--bg);color:var(--fg)}
+  button,select{font:inherit;padding:8px 11px;border:1px solid var(--line);border-radius:8px;background:var(--soft);color:var(--fg);cursor:pointer}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .row{display:flex;gap:6px;margin-top:6px;align-items:center}
+  .row select{margin-left:auto}
+  .chips{display:flex;gap:5px;overflow-x:auto;margin-top:6px;padding-bottom:4px;scrollbar-width:none}
+  .chips::-webkit-scrollbar{display:none}
+  .chip{white-space:nowrap;padding:5px 9px;border-radius:999px;font-size:13.5px}
+  .chip.off{opacity:.4}
+  .chip b{font-weight:600;margin-left:3px}
+  #status{font-size:13px;color:var(--muted);min-height:1.3em;padding-top:2px}
+  #map{flex:1;min-height:0}
+  #panel{border-top:1px solid var(--line);max-height:24vh;overflow:auto;background:var(--bg)}
+  #ph{padding:7px 10px;font-weight:600;cursor:pointer;position:sticky;top:0;background:var(--bg)}
+  #rampList{list-style:none;margin:0;padding:0 6px 6px}
+  #rampList li{display:flex;align-items:center;gap:8px;padding:6px 4px;border-top:1px solid var(--soft)}
+  #rampList .rt{flex:1;min-width:0;cursor:pointer}
+  #rampList .rt span{display:block;font-size:13px;color:var(--muted)}
+  .emo{font-size:20px;line-height:24px;text-align:center;text-shadow:0 0 2px #fff,0 0 2px #fff}
+  .leaflet-popup-content{margin:10px 12px;font-size:14.5px}
+  .pd{color:var(--muted);font-size:13px;margin-top:2px}
+  .hint{color:#8a5a00;font-size:12.5px;margin-top:3px}
+  .pb{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+  a.btn{display:inline-block;padding:7px 10px;border-radius:8px;background:var(--soft);color:var(--fg)!important;text-decoration:none;border:1px solid var(--line);font-size:14px}
+  a.btn.go{background:var(--go);border-color:var(--go);color:#fff!important}
+</style>
+</head>
+<body>
+<header>
+  <form id="f"><input id="q" type="search" placeholder="Adresse, Fahrschule oder 51.51, 7.10" enterkeyhint="search"><button class="primary">Suchen</button></form>
+  <div class="row">
+    <button id="gps" type="button">📍 Hier</button>
+    <button id="mid" type="button">⌖ Kartenmitte</button>
+    <button id="re" type="button" title="Neu laden (nicht aus dem Speicher)">↻</button>
+    <select id="rad" aria-label="Umkreis"><option value="1500">1,5 km</option><option value="2500">2,5 km</option><option value="4000">4 km</option></select>
+  </div>
+  <div class="chips" id="chips"></div>
+  <div id="status">Tipp: lange auf die Karte drücken = dort suchen.</div>
+</header>
+<div id="map"></div>
+<section id="panel" hidden><div id="ph">🛣️ Nächste Autobahn-Auffahrten</div><ol id="rampList"></ol></section>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+'use strict';
+// Daten: OpenStreetMap über Overpass (kein Schlüssel, kein Server). Navigation/Speichern: Google Maps per Link.
+const OVERPASS=['https://overpass-api.de/api/interpreter','https://overpass.private.coffee/api/interpreter','https://maps.mail.ru/osm/tools/overpass/api/interpreter'];
+const RAMP_R=10000,CACHE_MAX=6;
+const CATS=[
+  ['stop','🛑','Stopp',true],
+  ['rvl','🟠','Rechts vor links',true],
+  ['round','⭕','Kreisverkehr',true],
+  ['oneway','⛔','Verbot der Einfahrt',true],
+  ['rail','🚂','Bahnübergang',true],
+  ['ramp','🛣️','Auffahrt',true],
+  ['zone30','🟩','Zone 30',true],
+  ['give','🔺','Vorfahrt achten',false],
+  ['zebra','🚸','Zebrastreifen',false],
+  ['living','🏠','Spielstraße',false],
+];
+const store={get(k,d){try{const v=localStorage.getItem('psf.'+k);return v===null?d:JSON.parse(v)}catch(e){return d}},set(k,v){try{localStorage.setItem('psf.'+k,JSON.stringify(v));return true}catch(e){return false}}};
+const $=id=>document.getElementById(id);
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const rad=x=>x*Math.PI/180;
+function dist(a,b){const dLa=rad(b[0]-a[0]),dLo=rad(b[1]-a[1]);const h=Math.sin(dLa/2)**2+Math.cos(rad(a[0]))*Math.cos(rad(b[0]))*Math.sin(dLo/2)**2;return 12742000*Math.asin(Math.sqrt(h));}
+const km=m=>m<1000?Math.round(m/10)*10+' m':(m/1000).toFixed(1).replace('.',',')+' km';
+const R5=x=>Math.round(x*1e5)/1e5,P5=p=>[R5(p[0]),R5(p[1])];
+const when=t=>new Date(t).toLocaleString('de-DE',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const status=t=>{$('status').textContent=t;};
+
+// ---------- Karte ----------
+const last=store.get('center',null);
+const map=L.map('map',{zoomControl:false}).setView(last||[51.51,7.10],last?14:11);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>-Mitwirkende'}).addTo(map);
+L.control.zoom({position:'bottomright'}).addTo(map);
+const canvas=L.canvas({padding:.5,tolerance:10});
+const on=Object.assign(Object.fromEntries(CATS.map(c=>[c[0],c[3]])),store.get('on',{}));
+const layers={},counts={};
+for(const [k] of CATS){layers[k]=L.layerGroup();if(on[k])layers[k].addTo(map);}
+
+function renderChips(){
+  $('chips').innerHTML=CATS.map(([k,i,l])=>`<button type="button" class="chip${on[k]?'':' off'}" data-k="${k}">${i} ${l}${counts[k]!=null&&k!=='zone30'?`<b>${counts[k]}</b>`:''}</button>`).join('');
+}
+$('chips').onclick=e=>{const b=e.target.closest('.chip');if(!b)return;const k=b.dataset.k;on[k]=!on[k];on[k]?layers[k].addTo(map):layers[k].remove();store.set('on',on);renderChips();};
+
+// ---------- Popups mit Google-Maps-Knöpfen ----------
+const ll=p=>p[0].toFixed(6)+','+p[1].toFixed(6);
+const navUrl=p=>`https://www.google.com/maps/dir/?api=1&destination=${ll(p)}&travelmode=driving&dir_action=navigate`;
+function pop(title,sub,p,hint){
+  return `<b>${esc(title)}</b>${sub?'<br>'+esc(sub):''}<div class="pd">${center?km(dist(center,p))+' Luftlinie':''}</div>${hint?`<div class="hint">${esc(hint)}</div>`:''}`+
+    `<div class="pb"><a class="btn go" target="_blank" rel="noopener" href="${navUrl(p)}">▶ Navigieren</a>`+
+    `<a class="btn" target="_blank" rel="noopener" href="https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=${ll(p)}">👁 Street View</a>`+
+    `<a class="btn" target="_blank" rel="noopener" href="https://www.google.com/maps/search/?api=1&query=${ll(p)}">⭐ In Maps</a></div>`;
+}
+function addPoint(k,p,title,sub,hint){
+  const icon=CATS.find(c=>c[0]===k)[1];
+  const m=k==='rvl'?L.circleMarker(p,{renderer:canvas,radius:4.5,color:'#9a4a00',weight:1,fillColor:'#ff8c1a',fillOpacity:.9})
+                   :L.marker(p,{icon:L.divIcon({className:'emo',html:icon,iconSize:[24,24],iconAnchor:[12,12]})});
+  m.bindPopup(()=>pop(title,sub,p,hint),{maxWidth:290});
+  m.addTo(layers[k]);counts[k]=(counts[k]||0)+1;return m;
+}
+
+// ---------- Overpass (öffentliche Server, abends oft voll → mehrere Server, 2 Runden) ----------
+async function overpass(q,label){
+  let err;
+  for(let round=0;round<2;round++){
+    for(const url of OVERPASS){
+      const ctl=new AbortController(),t=setTimeout(()=>ctl.abort(),60000);
+      try{const r=await fetch(url,{method:'POST',body:new URLSearchParams({data:q}),signal:ctl.signal});if(!r.ok)throw new Error('HTTP '+r.status);return await r.json();}
+      catch(e){err=e.name==='AbortError'?new Error('Zeitüberschreitung'):e;status(`${label}: Kartenserver ausgelastet – versuche einen anderen …`);}
+      finally{clearTimeout(t);}
+    }
+    if(round===0)await sleep(4000);
+  }
+  throw err;
+}
+const A=(r,la,lo)=>`(around:${r},${la},${lo})`;
+const qLocal=(la,lo,r)=>`[out:json][timeout:60];
+(node${A(r,la,lo)}[highway~"^(stop|give_way|traffic_signals|mini_roundabout)$"];
+node${A(r,la,lo)}[railway=level_crossing];
+node${A(r,la,lo)}[highway=crossing][~"^crossing(_ref)?$"~"zebra"];);
+out;
+way${A(r,la,lo)}[highway~"^(primary|secondary|tertiary|unclassified|residential|living_street|trunk)(_link)?$"];
+out geom;`;
+// Auffahrten: nur Rampen + die Punkte, an denen sie die Autobahn berühren (statt ganzer Autobahnen)
+const qRamps=(la,lo)=>`[out:json][timeout:60];
+way${A(RAMP_R,la,lo)}[highway=motorway_link]->.ml;
+.ml out geom;
+node(w.ml)->.ln;
+way(bn.ln)[highway=motorway]->.mw;
+node(w.mw)->.mn;
+node.ln.mn;
+out skel;
+.mw out tags bb;
+node${A(RAMP_R,la,lo)}[highway=motorway_junction];out;
+nwr${A(RAMP_R,la,lo)}[highway~"^(services|rest_area)$"];out center;`;
+
+// ---------- Speicher pro Ort (damit bekannte Orte sofort und ohne Server da sind) ----------
+const cacheAll=()=>store.get('cache',[]);
+const cacheFind=(c,r)=>cacheAll().find(e=>e.r===r&&dist(e.c,c)<300);
+function cacheSave(res){
+  let all=cacheAll().filter(e=>!(e.r===res.r&&dist(e.c,res.c)<300));
+  all.unshift(res);all=all.slice(0,CACHE_MAX);
+  while(!store.set('cache',all)){if(all.length>1)all.pop();else{res.zone30=[];if(!store.set('cache',all))break;}}
+}
+
+// ---------- Suche ----------
+let center=null,busy=false,ring=null,pin=null,rampItems=[];
+function drawCenter(r){
+  ring&&ring.remove();pin&&pin.remove();
+  ring=L.circle(center,{radius:r,renderer:canvas,color:'#1f4f8a',weight:1.5,fill:false,dashArray:'5 6',interactive:false}).addTo(map);
+  pin=L.marker(center,{icon:L.divIcon({className:'emo',html:'📌',iconSize:[24,24],iconAnchor:[12,22]}),zIndexOffset:1000,interactive:false}).addTo(map);
+  map.fitBounds(ring.getBounds(),{padding:[10,10]});
+}
+async function search(la,lo,force){
+  if(busy)return status('Suche läuft noch …');
+  const r=+$('rad').value,hit=!force&&cacheFind([la,lo],r);
+  center=hit?hit.c:[R5(la),R5(lo)];store.set('center',center);
+  drawCenter(r);
+  if(hit){
+    render(hit);
+    if(hit.ramps)return status(`Aus dem Speicher (geladen ${when(hit.t)}). ↻ = neu laden.`);
+    busy=true;await loadRamps(hit);busy=false;return;
+  }
+  busy=true;const t0=Date.now();
+  const res={c:center,r,t:Date.now(),pts:[],zone30:[],living:[],ramps:null};
+  render(res);
+  status('Lade Prüfstellen … (10–40 s)');
+  try{Object.assign(res,local(await overpass(qLocal(center[0],center[1],r),'Prüfstellen'),r));render(res);}
+  catch(e){busy=false;return status(`Prüfstellen nicht geladen (${e.message}). Gleich nochmal ↻ – abends sind die Kartenserver oft voll.`);}
+  await loadRamps(res,t0);
+  busy=false;
+}
+async function loadRamps(res,t0){
+  status('Lade Autobahn-Auffahrten …');
+  try{res.ramps=ramps(await overpass(qRamps(res.c[0],res.c[1]),'Auffahrten'));render(res);
+    status(t0?`Fertig in ${Math.round((Date.now()-t0)/1000)} s. Punkt antippen → Navigieren / Street View.`:'Auffahrten nachgeladen.');}
+  catch(e){status(`Prüfstellen da, Auffahrten nicht geladen (${e.message}). Später ↻.`);}
+  cacheSave(res);
+}
+
+function render(res){
+  for(const k in layers){layers[k].clearLayers();counts[k]=0;}
+  for(const g of res.zone30)L.polyline(g,{renderer:canvas,color:'#2e9e4f',weight:4,opacity:.45,interactive:false}).addTo(layers.zone30);
+  const ln=new Set();
+  for(const s of res.living){
+    const p=s.g[Math.floor(s.g.length/2)];ln.add(s.n||p.join());
+    L.polyline(s.g,{renderer:canvas,color:'#8e44ad',weight:5,opacity:.75}).bindPopup(()=>pop('Spielstraße',s.n,p,'Verkehrsberuhigter Bereich – Schrittgeschwindigkeit')).addTo(layers.living);
+  }
+  counts.living=ln.size;
+  for(const [k,la,lo,t,s,h] of res.pts)addPoint(k,[la,lo],t,s,h);
+  rampItems=(res.ramps||[]).map(x=>({...x,m:addPoint('ramp',x.p,x.title,x.jname?'AS '+x.jname:'',x.hint)})).slice(0,6);
+  $('rampList').innerHTML=rampItems.map((x,i)=>`<li><div class="rt" data-i="${i}"><b>${esc(x.title)}</b><span>${esc([x.jname&&'AS '+x.jname,km(x.d)+' Luftlinie'].filter(Boolean).join(' · '))}</span></div><a class="btn go" target="_blank" rel="noopener" href="${navUrl(x.p)}">▶</a></li>`).join('');
+  const was=$('panel').hidden;$('panel').hidden=!rampItems.length;
+  if(was!==$('panel').hidden){map.invalidateSize();if(ring)map.fitBounds(ring.getBounds(),{padding:[10,10]});}
+  renderChips();
+}
+
+// ---------- Auswertung: Schilder, Kreuzungen, Zonen ----------
+function local(data,r){
+  const pts=[],zone30=[],living=[],seen=new Set();
+  const push=(k,p,t,s,h)=>{const key=k+Math.round(p[0]*1e4)+','+Math.round(p[1]*1e4);if(seen.has(key))return;seen.add(key);pts.push([k,R5(p[0]),R5(p[1]),t,s||'',h||'']);};
+  const nodes=[],wmap=new Map();
+  for(const el of data.elements){if(el.type==='node')nodes.push(el);else if(el.type==='way'&&el.nodes&&el.geometry)wmap.set(el.id,el);}
+  const W=[...wmap.values()];
+  const tg=(w,k)=>(w.tags&&w.tags[k])||'',hw=w=>tg(w,'highway');
+  const isRound=w=>/^(roundabout|circular)$/.test(tg(w,'junction'));
+  const minor=w=>/^(residential|unclassified)$/.test(hw(w))&&!isRound(w)&&!tg(w,'priority_road');
+  const coord=new Map(),nodeWays=new Map();
+  for(const w of W)w.nodes.forEach((id,i)=>{const g=w.geometry[i];if(g)coord.set(id,[g.lat,g.lon]);let a=nodeWays.get(id);if(!a)nodeWays.set(id,a=[]);if(!a.includes(w))a.push(w);});
+  const inR=p=>dist(center,p)<=r*1.05;
+  const street=id=>{const s=new Set();for(const w of nodeWays.get(id)||[]){const n=tg(w,'name')||tg(w,'ref');if(n)s.add(n);}const a=[...s];return a.length>1?'Ecke '+a.slice(0,3).join(' / '):(a[0]||'');};
+
+  // Linien: Zone 30, Spielstraße
+  for(const w of W){
+    const g=w.geometry.map(x=>[R5(x.lat),R5(x.lon)]);
+    if(hw(w)==='living_street')living.push({n:tg(w,'name'),g});
+    else if(/^(residential|unclassified|tertiary)$/.test(hw(w))&&(/zone:?30/i.test(tg(w,'zone:maxspeed')+' '+tg(w,'maxspeed:type')+' '+tg(w,'source:maxspeed')+' '+tg(w,'zone:traffic'))||tg(w,'zone:maxspeed')==='DE:30'||(tg(w,'maxspeed')==='30'&&minor(w))))zone30.push(g);
+  }
+
+  // Schilder, Bahnübergänge, Zebrastreifen
+  const signs=[];
+  for(const n of nodes){
+    const t=n.tags||{},p=[n.lat,n.lon];
+    if(/^(stop|give_way|traffic_signals|mini_roundabout)$/.test(t.highway||''))signs.push(p);
+    if(!inR(p))continue;
+    if(t.highway==='stop')push('stop',p,'Stoppschild',street(n.id),t.stop==='all'?'Allseitiger Stopp':'');
+    else if(t.highway==='give_way')push('give',p,'Vorfahrt achten',street(n.id));
+    else if(t.highway==='mini_roundabout')push('round',p,'Mini-Kreisverkehr',street(n.id));
+    if(t.railway==='level_crossing'){const b=t['crossing:barrier']||'';push('rail',p,'Bahnübergang',street(n.id),b==='no'?'ohne Schranke':b?'mit Schranke':'');}
+    if(t.highway==='crossing'&&/zebra/.test((t.crossing||'')+' '+(t.crossing_ref||'')))push('zebra',p,'Zebrastreifen',street(n.id));
+  }
+
+  // Kreisverkehre (mehrere Kartenstücke zu einem zusammenfassen)
+  const RW=W.filter(isRound),par=new Map(),own=new Map();
+  const find=x=>{while(par.get(x)!==x){par.set(x,par.get(par.get(x)));x=par.get(x);}return x;};
+  RW.forEach(w=>par.set(w.id,w.id));
+  for(const w of RW)for(const id of w.nodes){const o=own.get(id);if(o!==undefined)par.set(find(o),find(w.id));else own.set(id,w.id);}
+  const grp=new Map();for(const w of RW){const g=find(w.id);if(!grp.has(g))grp.set(g,[]);grp.get(g).push(w);}
+  for(const ws of grp.values()){
+    let lanes=0;const ids=new Set();
+    for(const w of ws){lanes=Math.max(lanes,+tg(w,'lanes')||0);w.nodes.forEach(id=>ids.add(id));}
+    const g0=ws[0].geometry[0],p=[g0.lat,g0.lon];if(!inR(p))continue;
+    const names=new Set();for(const id of ids)for(const w of nodeWays.get(id)||[])if(!isRound(w)){const nm=tg(w,'name')||tg(w,'ref');if(nm)names.add(nm);}
+    push('round',p,lanes>=2?'Kreisverkehr (mehrspurig)':'Kreisverkehr',names.size?'mit '+[...names].slice(0,3).join(', '):'');
+  }
+
+  // Rechts vor links: Kreuzung nur aus Wohn-/Nebenstraßen, ohne Schild/Ampel in der Nähe
+  const arms=new Map(),excl=new Set(own.keys());
+  for(const w of W){
+    if(minor(w)){const n=w.nodes.length;w.nodes.forEach((id,i)=>arms.set(id,(arms.get(id)||0)+(i===0||i===n-1?1:2)));}
+    else for(const id of w.nodes)excl.add(id);
+  }
+  for(const [id,a] of arms){
+    if(a<3||excl.has(id))continue;
+    const p=coord.get(id);if(!p||!inR(p))continue;
+    if(signs.some(s=>Math.abs(s[0]-p[0])<6e-4&&Math.abs(s[1]-p[1])<9e-4&&dist(s,p)<30))continue;
+    push('rvl',p,'Rechts vor links',street(id),'vermutlich – kein Schild in der Karte erfasst. Kurz mit Street View prüfen.');
+  }
+
+  // Verbot der Einfahrt: echtes Ende einer Einbahnstraße
+  const entries=new Map(),exits=[];
+  for(const w of W){
+    const ow=tg(w,'oneway');
+    if(isRound(w)||!/^(residential|unclassified|tertiary|living_street)$/.test(hw(w))||!/^(yes|1|true|-1)$/.test(ow))continue;
+    const rev=ow==='-1',a=rev?w.nodes[w.nodes.length-1]:w.nodes[0],b=rev?w.nodes[0]:w.nodes[w.nodes.length-1];
+    if(!entries.has(a))entries.set(a,[]);entries.get(a).push(w);exits.push([b,w]);
+  }
+  for(const [id,w] of exits){
+    if((entries.get(id)||[]).some(x=>tg(x,'name')===tg(w,'name')))continue; // Straße geht als Einbahnstraße weiter
+    if((nodeWays.get(id)||[]).length<2)continue;
+    const p=coord.get(id);if(!p||!inR(p))continue;
+    const nm=tg(w,'name');
+    push('oneway',p,'Verbot der Einfahrt',`Ende der Einbahnstraße${nm?' '+nm:''}`,tg(w,'oneway:bicycle')==='no'?'Radfahrer frei':'');
+  }
+  return {pts,zone30,living};
+}
+
+function along(g,f){
+  const seg=[];let tot=0;
+  for(let i=1;i<g.length;i++){const d=dist(g[i-1],g[i]);seg.push(d);tot+=d;}
+  let t=tot*f;
+  for(let i=0;i<seg.length;i++){if(t<=seg[i]){const k=seg[i]?t/seg[i]:0;return [g[i][0]+(g[i+1][0]-g[i][0])*k,g[i][1]+(g[i+1][1]-g[i][1])*k];}t-=seg[i];}
+  return g[g.length-1];
+}
+
+function ramps(data){
+  const links=[],merge=new Map(),mws=[],jn=[],svc=[];
+  for(const el of data.elements){
+    const h=(el.tags&&el.tags.highway)||'';
+    if(el.type==='way'&&h==='motorway_link'&&el.geometry){
+      const rev=el.tags.oneway==='-1',g=el.geometry.map(x=>[x.lat,x.lon]);
+      links.push({t:el.tags,n:rev?[...el.nodes].reverse():el.nodes,g:rev?g.reverse():g});
+    }else if(el.type==='way'&&h==='motorway'&&el.bounds)mws.push(el);
+    else if(el.type==='node'&&!el.tags)merge.set(el.id,[el.lat,el.lon]);
+    else if(el.type==='node'&&h==='motorway_junction')jn.push({p:[el.lat,el.lon],t:el.tags});
+    else if(/^(services|rest_area)$/.test(h))svc.push(el.center?[el.center.lat,el.center.lon]:[el.lat,el.lon]);
+  }
+  const refAt=id=>{const p=merge.get(id);let best='',ba=Infinity;for(const w of mws){const b=w.bounds;if(p[0]<b.minlat||p[0]>b.maxlat||p[1]<b.minlon||p[1]>b.maxlon)continue;const a=(b.maxlat-b.minlat)*(b.maxlon-b.minlon);if(a<ba){ba=a;best=w.tags.ref||'';}}return best;};
+  const byLast=new Map();
+  for(const L of links){const k=L.n[L.n.length-1];if(!byLast.has(k))byLast.set(k,[]);byLast.get(k).push(L);}
+  const out=[];
+  for(const L of links){
+    const last=L.n[L.n.length-1];
+    if(!merge.has(last)||merge.has(L.n[0]))continue;      // nur Rampen, die IN die Autobahn münden
+    const chain=[L];let cur=L,ok=true;
+    for(let i=0;i<15;i++){                                 // rückwärts bis zur Stadtstraße
+      const pr=(byLast.get(cur.n[0])||[]).filter(x=>!chain.includes(x));
+      if(!pr.length)break;cur=pr[0];chain.push(cur);
+      if(merge.has(cur.n[0])){ok=false;break;}             // Autobahnkreuz, keine Auffahrt
+    }
+    if(!ok)continue;
+    const start=cur.g[0];
+    if(dist(center,start)>RAMP_R||svc.some(s=>dist(s,start)<600))continue;
+    const ref=refAt(last)||chain.map(x=>x.t['destination:ref']).find(Boolean)||'';
+    const dest=(chain.map(x=>x.t.destination).find(Boolean)||'').split(';').slice(0,3).join(', ');
+    let j=null,jd=2500;for(const x of jn){const d=dist(x.p,start);if(d<jd){jd=d;j=x;}}
+    out.push({p:P5(along(L.g,.4)),title:`Auffahrt ${ref}`.trim()+(dest?` → ${dest}`:''),
+      jname:j?((j.t.name||'')+(j.t.ref?` (${j.t.ref})`:'')).trim():'',
+      hint:dest?'':'Richtung nicht in der Karte – vorher auf der Karte ansehen.',d:Math.round(dist(center,start))});
+  }
+  return out.sort((a,b)=>a.d-b.d);
+}
+
+// ---------- Bedienung ----------
+$('rampList').onclick=e=>{const el=e.target.closest('.rt');if(!el)return;const x=rampItems[+el.dataset.i];map.setView(x.p,15);if(map.hasLayer(layers.ramp))x.m.openPopup();};
+$('ph').onclick=()=>{const l=$('rampList');l.hidden=!l.hidden;map.invalidateSize();};
+$('f').onsubmit=async e=>{
+  e.preventDefault();const q=$('q').value.trim();if(!q)return;$('q').blur();
+  const m=q.match(/^\s*(-?\d{1,2}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)\s*$/);
+  if(m)return search(+m[1],+m[2]);
+  status('Suche Adresse …');
+  try{
+    const r=await fetch('https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=de&accept-language=de&q='+encodeURIComponent(q));
+    const j=await r.json();
+    if(!j.length)return status('Adresse nicht gefunden. Tipp: in Google Maps lange auf den Ort drücken, Koordinaten kopieren und hier einfügen.');
+    search(+j[0].lat,+j[0].lon);
+  }catch(err){status('Adresssuche fehlgeschlagen: '+err.message);}
+};
+$('gps').onclick=()=>{
+  if(!navigator.geolocation)return status('Kein GPS verfügbar.');
+  status('Hole Standort …');
+  navigator.geolocation.getCurrentPosition(p=>search(p.coords.latitude,p.coords.longitude),e=>status('Standort nicht verfügbar: '+e.message),{enableHighAccuracy:true,timeout:15000,maximumAge:60000});
+};
+$('mid').onclick=()=>{const c=map.getCenter();search(c.lat,c.lng);};
+$('re').onclick=()=>{if(center)search(center[0],center[1],true);else status('Erst einen Ort suchen.');};
+map.on('contextmenu',e=>search(e.latlng.lat,e.latlng.lng));
+$('rad').value=store.get('rad','2500');
+$('rad').onchange=()=>store.set('rad',$('rad').value);
+renderChips();
+</script>
+</body>
+</html>
